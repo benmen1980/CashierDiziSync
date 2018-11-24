@@ -126,7 +126,7 @@ begin
 create table #tmpItems(
 			BILLNO varchar(50),
 			LINE int,
-			PART int,
+			PART varchar(22),
 			price float,
 			Qty float,
 			Total float,
