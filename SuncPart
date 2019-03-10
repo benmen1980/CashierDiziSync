@@ -1,0 +1,284 @@
+USE [system]
+GO
+/****** Object:  StoredProcedure [dbo].[ZKUP_SyncronizeParts2]    Script Date: 10/03/2019 11:22:47 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+-- ZKUP_SyncronizeParts 'hemed'
+ALTER PROCEDURE [dbo].[ZKUP_SyncronizeParts2]
+	@debugflag bit = 0
+AS
+BEGIN
+	SET NOCOUNT on;
+
+declare @iLines as int = 0;
+declare @uLines as int = 0;
+
+declare @sqlquery nvarchar(max);
+declare @toEnv as varchar(100);
+declare @dname as varchar(50);
+
+
+declare c cursor for
+select NAME, KUPENV, DB, LASTSYNCDATE, BOOKNUMID
+from system.dbo.ZKUP_KUPOT
+where NAME <> '' 
+and NAME <> 'HEADOFFICE'
+and SYNCPARTFLAG = 'Y';
+
+declare @name as varchar(50), @kupenv as varchar(50);
+declare @db as varchar(50), @LASTSYNCDATE as int;
+declare @booknumid as varchar(50);
+
+open c;
+fetch next from c into @name, @kupenv, @db, @LASTSYNCDATE, @booknumid;
+
+while @@FETCH_STATUS = 0
+begin
+
+	begin try
+	
+		set @iLines = 0;
+		set @uLines = 0;
+
+		print ' ** Begin *PART* sync for ' + @name + ' @ ' + coalesce(@db,'');
+
+		set @toEnv = @db;
+		set @dname = @kupenv;
+		if (coalesce(@toEnv,'') = '')  
+		begin
+			raiserror('No @toenv',15,1);
+			break;
+		end
+
+		if (not exists (select name from sys.databases where name = @dname))
+		begin
+			raiserror('Database %s not found in sys.databasses',15,1, @dname);
+			break;
+		end
+	
+
+		-- get base pricelist date
+		declare @PRICELISTDATE as int
+		set @PRICELISTDATE = 0;
+
+		set @sqlquery = 
+		'SELECT @PRICELISTDATE=PLDATE FROM [' + @dname + '].[dbo].PRICELISTDATE
+		WHERE PLIST = -1 AND VALID = ''Y'''
+		;
+		exec sp_executesql @sqlquery , N'@PRICELISTDATE int OUTPUT', 
+			@PRICELISTDATE OUTPUT
+ 
+		 print 'Price list date:' + convert(varchar, @PRICELISTDATE);
+
+		-- insert parts from Priority in a temporary table
+		if OBJECT_ID('tempdb.dbo.#tempPriorityTable','U') is not null 
+			drop table #tempPriorityTable;
+		CREATE TABLE #tempPriorityTable(PART int, PARTNAME varchar(25), PARTDES varchar(48), 
+		BARCODE varchar(25), UNIT varchar(16), FAMILY int, PRICE float, UDATE int);
+ 
+		set @sqlquery = 
+		'INSERT INTO #tempPriorityTable 
+		SELECT PART.PART, PARTNAME, system.dbo.tabula_hebconvert(PARTDES) [PARTDES], BARCODE, 
+		(case when coalesce(U.PARAM, '''') <> '''' then U.PARAM else UNIT.UNITNAME end) [UNIT], 
+		(case when coalesce(F.PARAM,'''') <> '''' then F.PARAM else '''' end) [FAMILY],
+		--PARTPRICE.PRICE * (1.0 + MAX(TAXPERCENT.TAXPERCENT1) / 100.0), 
+		case when coalesce(INFO_PARTMAGENTO.special_price,0) = 0 then PARTPRICE.VATPRICE else coalesce(INFO_PARTMAGENTO.special_price,0) end [PRICE],
+		PART.UDATE
+		FROM [' + @dname + '].[dbo].PART PART
+		inner join [' + @dname + '].[dbo].UNIT UNIT on PART.PUNIT = UNIT.UNIT
+		inner join [' + @dname + '].[dbo].PARTPARAM PARTPARAM on PART.PART = PARTPARAM.PART
+		left outer join [' + @dname + '].[dbo].PARTPRICE PARTPRICE on PART.PART = PARTPRICE.PART AND PARTPRICE.PLIST = -1 AND PARTPRICE.PLDATE = @PRICELISTDATE
+		left outer join [' + @dname + '].[dbo].TAXPERCENT TAXPERCENT on DATEDIFF(mi, ''01/01/1988'', getdate()) BETWEEN TAXPERCENT.FROMDATE AND TAXPERCENT.TODATE
+		left outer join [' + @dname + '].[dbo].ZKUP_CONVPARAMS U on PART.PUNIT = U.KEY1 AND U.TYPE = ''U''
+		left outer join [' + @dname + '].[dbo].ZKUP_CONVPARAMS F on PART.FAMILY = F.KEY1 AND F.TYPE = ''F''
+		left join [' + @dname + '].[dbo].INFO_PARTMAGENTO INFO_PARTMAGENTO on INFO_PARTMAGENTO.PART = PART.PART
+		WHERE PART.PART > 0
+		--AND PART.PARTNAME in (''A729000000213'',''A500000000457'')
+		AND PART.INFO_BRANCH = 0
+		
+		GROUP BY PART.PART, PARTNAME,
+				 system.dbo.tabula_hebconvert(PARTDES), 
+				 BARCODE, 
+				 case when coalesce(INFO_PARTMAGENTO.special_price,0) = 0 then PARTPRICE.VATPRICE else coalesce(INFO_PARTMAGENTO.special_price,0) end,
+				 (case when coalesce(U.PARAM, '''') <> '''' then U.PARAM else UNIT.UNITNAME end), 
+				 (case when coalesce(F.PARAM, '''') <> '''' then F.PARAM else '''' end), 
+				 PART.UDATE'
+		;
+
+
+		print '==============';
+		print replace(@sqlquery,'@PRICELISTDATE', convert(varchar(20),@PRICELISTDATE));
+		print '==============';
+
+		exec sp_executesql @sqlquery , N'@PRICELISTDATE int', 
+			@PRICELISTDATE
+
+	--	select * from #tempPriorityTable order by PART;
+
+		-- insert parts from Kupot system in a temporary table
+		if OBJECT_ID('tempdb.dbo.#tempKupotTable','U') is not null 
+			drop table #tempKupotTable;
+		CREATE TABLE #tempKupotTable(PARTNAME bigint);
+
+
+		set @sqlquery = 
+		'INSERT INTO #tempKupotTable SELECT fldCode FROM ' + @toEnv + '.[dbo].tblItems'
+		;
+
+		exec sp_executesql @sqlquery;
+
+		declare @PART int
+		declare @PARTNAME varchar(25) 
+		declare @KUPOTPARTNAME int
+		declare @PARTDES varchar(48)
+		declare @BARCODE varchar(16)
+		declare @UNIT int 
+		declare @FAMILY int 
+		declare @PRICE float
+		declare @PRICEINT int; -- kupa works with int in agorot
+		declare @UDATE int 
+		declare @debug as varchar(max);
+		declare @i as int = 0 ;
+
+		set @i = 0;
+
+		if (1=1) -- don't insert parts into kupot db
+		begin
+			DECLARE db_cursor CURSOR FOR  
+			SELECT PART, #tempPriorityTable.PARTNAME, PARTDES, BARCODE, UNIT, FAMILY, PRICE, coalesce(#tempKupotTable.PARTNAME, 0), UDATE
+			FROM #tempPriorityTable
+			left outer join #tempKupotTable on #tempKupotTable.PARTNAME = #tempPriorityTable.PART 
+			;
+
+			OPEN db_cursor  
+			FETCH NEXT FROM db_cursor INTO @PART, @PARTNAME, @PARTDES, @BARCODE, @UNIT, @FAMILY, @PRICE, @KUPOTPARTNAME, @UDATE  
+
+			WHILE @@FETCH_STATUS = 0  
+			BEGIN 
+
+				declare @ppp int
+				-- set @ppp = case when ISNUMERIC(@PARTNAME) = 1 then CONVERT(int, @PARTNAME) else @PART end
+				set @ppp = @PART;
+				if (@KUPOTPARTNAME <> 0)
+	
+				BEGIN
+					set @i = @i + 1;
+					if @i % 500 = 0 RAISERROR( '%i items,' ,0,1,@i) WITH NOWAIT 
+					-- Update part -- not required
+					set @debug = '>> Update ' + convert(varchar, @ppp);
+
+			/*		set @sqlquery = 
+			'UPDATE ' + @toEnv + '.[dbo].tblItems SET fldName = @PARTDES, fldBarcode = @BARCODE, fldSalePrice = @PRICE, fldUnit = @UNIT, fldDepartment = @FAMILY, fldUpdateDate = getdate(), fldNameHEB = @PARTDES, fldAdditionalInfoHEB = @PARTDES ' +
+			'WHERE fldCode = @ppp AND dateadd(mi, @UDATE, ''01/01/1988'') > fldUpdateDate' 
+			;
+			*/
+
+			set @sqlquery = 'exec ' + @toEnv + '.[dbo].INFO_UpdateItems 
+			@ppp = @ppp, @PARTDES = @PARTDES, @BARCODE = @BARCODE, @UNIT = @UNIT,
+			@FAMILY = @FAMILY, @PRICEINT = @PRICEINT, @UDATE =  @UDATE;'
+
+			set @uLines = @uLines + 1;
+		
+				END
+				ELSE
+				BEGIN
+				-- insert new part
+				set @debug = '>> Insert ' + convert(varchar, @ppp);
+					set @sqlquery = 
+			'INSERT INTO ' + @toEnv + '.[dbo].tblItems
+			(fldCode,fldType,fldName,fldBarcode,fldSalePrice,fldUnit,fldDepartment,fldUpdateDate,fldVAT, fldNameHEB, fldAdditionalInfoHEB,fldAllowReturn,fldRequireReturnTicket,fldPromotionable)' +
+			'VALUES
+			(@ppp, 1, @PARTDES, @BARCODE, @PRICEINT, @UNIT, @FAMILY, getdate(), 1, @PARTDES, @PARTDES,1,1,1)' 
+			;
+			set @iLines = @iLines + 1;
+
+				END;
+				set @PRICEINT = convert(int,@PRICE * 100.0) ; -- prices are in agurot
+	
+	
+				if @debugflag <> 0 
+				begin
+					PRINT '>> Query ' + (CONVERT( VARCHAR(24), GETDATE(), 121));
+					set @debug = @sqlquery;
+					set @debug = replace(@debug,'@ppp,',coalesce(convert(varchar,@ppp),'') + ',');
+					set @debug = replace(@debug,'@PARTDES,',coalesce(convert(varchar,@PARTDES),'')+ ',');
+					set @debug = replace(@debug,'@BARCODE,',coalesce(convert(varchar,@BARCODE),'')+ ',');
+					set @debug = replace(@debug,'@PRICEINT,',coalesce(convert(varchar,@PRICEINT),'')+ ',');
+					set @debug = replace(@debug,'@UNIT,',coalesce(convert(varchar,@UNIT),'')+ ',');
+					set @debug = replace(@debug,'@FAMILY,',coalesce(convert(varchar,@FAMILY),'')+ ',');
+					set @debug = replace(@debug,'@UDATE,',coalesce(convert(varchar,@UDATE),'')+ ',');
+					set @debug = replace(@debug,'getdate()',coalesce(convert(varchar,getdate()),''));
+
+					print @debug;
+					print '"' + coalesce(@PARTDES,'') + '"';	
+				end
+
+				exec sp_executesql @sqlquery ,
+				 N'@ppp int, @PARTDES varchar(48), @BARCODE varchar(16), @PRICEINT int, @UNIT int, @FAMILY int, @UDATE int', 
+					@ppp, @PARTDES, @BARCODE, @PRICEINT, @UNIT, @FAMILY, @UDATE 
+
+					if @debugflag <> 0 PRINT '>> Fetch ' + (CONVERT( VARCHAR(24), GETDATE(), 121));
+				   FETCH NEXT FROM db_cursor INTO @PART, @PARTNAME, @PARTDES, @BARCODE, @UNIT, @FAMILY, @PRICE, @KUPOTPARTNAME, @UDATE 
+			END  
+
+			CLOSE db_cursor  
+			DEALLOCATE db_cursor 
+
+
+			update system.dbo.ZKUP_KUPOT
+			set	LASTPARTSYNC     = datediff(mi,'1/01/1988', getdate())
+			where  NAME = @name and KUPENV = @kupenv;
+
+		end; -- -- don't insert parts into kupot db
+
+		drop table #tempPriorityTable ;
+		drop table #tempKupotTable ;
+		/* update secondary cashier */
+		set @sqlquery = 'exec ' + @toEnv + '.[dbo].INFO_UpdateSecCashier'
+		exec sp_executesql @sqlquery;
+
+		
+		-- retrieve all parts to priority
+		SET @sqlquery = 
+			'DELETE FROM [' + @dname + '].[dbo].ZKUP_PART' ;
+		exec sp_executesql @sqlquery
+
+		set @sqlquery = 
+		'INSERT INTO [' + @dname + '].[dbo].ZKUP_PART(PARTNAME, PARTDES, BARCODE, PRICE, UNIT, FAMILY, UDATE)
+			SELECT fldCode, left(fldName,48), fldBarcode, coalesce(fldSalePrice, 0.0) / 100.0, fldUnit, fldDepartment, DATEDIFF(mi, ''01/01/1988'', coalesce(fldUpdateDate, getdate()))
+		FROM ' + @toEnv + '.[dbo].tblItems' ;
+		--exec sp_executesql @sqlquery
+
+		print 'Inserted:' + convert(varchar(10),@iLines);
+		print 'Updated :' + convert(varchar(10),@uLines);
+
+		set @sqlquery = 'select * from ' + @dname + '.dbo.ZKUP_PART;'
+		exec sp_executesql @sqlquery
+
+		
+	end try
+	begin catch
+		declare @errMsg as varchar(8000);
+		declare @errNum as int;
+		select @errMsg = ERROR_MESSAGE(), @errNum = ERROR_NUMBER()
+		raiserror(' >>> ZKUP %s - Error syncing parts %s %d',1,1,@name, @errMsg, @errNum) with log;
+	end catch
+
+
+fetch next from c into @name, @kupenv, @db, @LASTSYNCDATE, @booknumid;
+
+end
+
+close c;
+deallocate c;
+
+END 
+
+
+
+
+
