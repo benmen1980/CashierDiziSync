@@ -1,0 +1,293 @@
+USE [system]
+GO
+
+/****** Object:  StoredProcedure [dbo].[royy_sync_transactions_new_flag]    Script Date: 31/03/2019 08:01:39 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE PROCEDURE [dbo].[royy_sync_transactions_new_flag]
+AS
+
+declare	@daysback int = 5
+
+BEGIN
+	SET NOCOUNT off;
+
+declare @sqlquery nvarchar(max)
+declare @toEnv as varchar(100)
+declare @dname as varchar(50);
+
+declare c cursor for
+select NAME, KUPENV, DB, LASTSYNCDATE, BOOKNUMID
+from system.dbo.ZKUP_KUPOT
+where NAME <> '' 
+and SYNCFLAG2 = 'Y'
+;
+
+declare @name as varchar(50), @kupenv as varchar(50);
+declare @db as varchar(50), @LASTSYNCDATE as int;
+declare @booknumid as varchar(50);
+
+open c;
+fetch next from c into @name, @kupenv, @db, @LASTSYNCDATE, @booknumid;
+
+while @@FETCH_STATUS = 0
+begin
+
+	print ' ** Begin sync for ' + @name + ' @ ' + coalesce(@db,'');
+
+	set @toEnv = @db;
+	set @dname = @kupenv;
+	if (coalesce(@toEnv,'') = '')  
+	begin
+		raiserror('No @toenv',15,1);
+		break;
+	end
+
+	if (not exists (select name from sys.databases where name = @dname))
+	begin
+		raiserror('Database %s not found in sys.databasses',15,1, @dname);
+		break;
+	end
+	
+	set @LASTSYNCDATE = @LASTSYNCDATE - (24*60 * @daysback); -- 1 day overlap
+	
+	begin try
+	
+		print 'Sync from:' + convert(varchar(20), system.dbo.tabula_dateconvert(@LASTSYNCDATE));
+  
+		begin transaction;
+
+		
+
+
+		-- Payments
+		print 'Payments:';
+
+		create table #tmpPayments(
+		BILLNO varchar(50), 
+		LINE int, 
+		PAYMENTCODE varchar(50), 
+		GROUPPAYMENTCODE varchar(50), 
+		QPRICE float, 
+		BOOKNUM varchar(50), 
+		BANKCODE varchar(50), 
+		BRANCH varchar(50), 
+		PAYACCOUNT varchar(50),
+		IDNUMBER varchar(50), 
+		PAYDATE varchar(50), 
+		VALIDMONTH varchar(50), 
+		CARDNUM varchar(50), 
+		CREDITCODE varchar(50), 
+		NUMPAY varchar(50), 
+		FIRSTPAY float
+		)
+
+		set @sqlquery = '
+		insert into #tmpPayments
+		Exec  '+ @toEnv +'.[dbo].[royy_Payments] '  + @booknumid
+
+		exec sp_executesql @sqlquery 
+		
+
+		set @sqlquery = 
+		'INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS_PAY(BILLNO, LINE, PAYMENTCODE, GROUPPAYMENTCODE, QPRICE, BOOKNUM, BANKCODE, BRANCH, PAYACCOUNT,
+		IDNUMBER, PAYDATE, VALIDMONTH, CARDNUM, CREDITCODE, NUMPAY, FIRSTPAY)
+		SELECT BILLNO, LINE, PAYMENTCODE, GROUPPAYMENTCODE , 
+		QPRICE, BOOKNUM , BANKCODE, BRANCH, PAYACCOUNT ,IDNUMBER, 
+		PAYDATE, VALIDMONTH , CARDNUM, CREDITCODE, 	NUMPAY, FIRSTPAY
+		from #tmpPayments'  ;
+
+	 -- print @sqlquery
+		exec sp_executesql @sqlquery 
+
+		
+		drop table #tmpPayments
+		
+			-- Items
+		print 'Items:';
+
+		-- tmpItems
+
+
+		
+create table #tmpItems(
+			BILLNO varchar(50),
+			LINE int,
+			PART varchar(22),
+			price float,
+			Qty float,
+			Total float,
+			NetTotal float,
+			VAT int,
+			VATRate float,
+			Value varchar(50),
+			OpenDate date
+			)
+		
+		set @sqlquery = '
+		insert into #tmpItems
+		Exec  '+ @toEnv +'.[dbo].[royy_TransBills]
+		'
+
+		--print @sqlquery
+
+		exec sp_executesql @sqlquery
+
+	--	select * from #tmpItems
+		
+		set @sqlquery ='
+		INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS_PART
+		 (BILLNO  , LINE, PARTNAME, PRICE, QUANT, QPRICE, DISPRICE, VATFLAG, VAT, FIELDVALUE)
+		 select BILLNO + @booknumid,LINE,PART.PARTNAME,price ,Qty ,Total ,NetTotal ,VAT,VATRate ,Value
+		 from #tmpItems
+		 inner join [a080413].[dbo].PART on #tmpItems.PART = PART.PART'
+
+		--print @sqlquery
+		exec sp_executesql @sqlquery , N'@LASTSYNCDATE int, @booknumid varchar(50)', 	@LASTSYNCDATE, @booknumid
+		
+		drop table #tmpItems
+		
+		-- Bills
+		print 'Bills:';
+
+		create table #tmpBills(
+			BILLNO varchar(50),
+			BILLDATE  int,
+			IDENTCUSTNAME varchar(22),
+			CLOSETYPE varchar(22),
+			CASHIER varchar(22),
+			CUSTNAME varchar(22)
+			)
+
+
+			set @sqlquery = '
+		insert into #tmpBills
+		Exec  '+ @toEnv +'.[dbo].[royy_Bills] ' + @booknumid + ''
+		
+
+		--print @sqlquery
+
+		exec sp_executesql @sqlquery
+
+		set @sqlquery = 
+		'INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS(BILLNO, CURDATE, IDENTCUSTNAME, CLOSETYPE, CASHIER,CUSTNAME)
+		SELECT BILLNO,BILLDATE,IDENTCUSTNAME,CLOSETYPE,CASHIER,CUSTNAME
+		from #tmpBills
+		'
+		
+		--print @sqlquery
+		exec sp_executesql @sqlquery
+
+		drop table #tmpBills
+
+
+		-- mark giftCard LOADED = G  accoridng to fldType = 9000
+
+		set @sqlquery = '
+		
+		
+		SELECT fldBill as ''bill'',convert(Varchar(50),fldBill) + ''-'' + convert(varchar,tblSession.fldTerminal) + @booknumid as ''bill2''		
+		into #myTemp
+		FROM ' + @toEnv + '.[dbo].tblTransBills tblTransBills WITH (NOLOCK)
+		inner join ' + @toEnv + '.[dbo].[tblTransMain] tblTransMain WITH (NOLOCK) on tblTransMain.fldSequence = tblTransBills.fldSequence
+		inner join ' + @toEnv + '.[dbo].[tblSession] tblSession WITH (NOLOCK) on tblSession.fldSessionID = tblTransMain.fldSessionID
+		inner join ' + @toEnv + '.[dbo].[tblTranspayments] tblTranspayments WITH (NOLOCK) on tblTransMain.fldSequence = tblTranspayments. fldSequence and tblTranspayments.fldType in (9000,4)
+		where tblTransBills.fldCloseMode in (0, 2)
+		and fldOpenTime >= dateadd(mi, @LASTSYNCDATE, ''01/01/1988'')
+		
+		update [' + @dname + '].[dbo].ZKUP_LOADBILLS
+		set LOADED =''G'' where BILLNO in (select bill2 from #myTemp )
+		DROP TABLE #myTemp
+	
+	';
+
+	 exec sp_executesql @sqlquery , N'@LASTSYNCDATE int, @booknumid varchar(50)', 	@LASTSYNCDATE, @booknumid
+
+	 -- end giftcard LOADED  set to G end
+
+
+
+
+
+		-- do not sync 0 value invoices - start
+
+				set @sqlquery = '		
+				-- total quant in ainvoice (per part) is 0
+				-- total sum in payments is also 0
+
+				update [' + @dname + '].dbo.ZKUP_LOADBILLS
+				set LOADED = ''Y'', MESSAGE = ''לא נמכרו פריטים. לכן לא נוצרה חשבונית''
+				where LOADED not in (''Y'',''G'') and BILLNO in
+				(
+				select BILLNO
+				from
+				(
+				select BILLNO
+				from [' + @dname + '].dbo.ZKUP_LOADBILLS
+				except
+				select	BILLNO 
+				from [' + @dname + '].dbo.ZKUP_LOADBILLS_PART lbp
+				group by BILLNO, PARTNAME
+				having sum(QUANT) <> 0
+				) baase
+					intersect
+				-- Total 0 in bills
+				select	BILLNO --, sum(QPRICE)
+				from	[' + @dname + '].dbo.ZKUP_LOADBILLS_PAY pay
+				group by BILLNO
+				having   sum(QPRICE) = 0
+				union -- no load bills part lines
+				select  BILLNO
+				from	[' + @dname + '].dbo.ZKUP_LOADBILLS lb
+				where	(select count(*) from [' + @dname + '].dbo.ZKUP_LOADBILLS_PART lbp where lbp.BILLNO = lb.BILLNO) = 0
+				)
+				';
+
+	  	-- exec sp_executesql @sqlquery
+
+
+		 -- do not sync 0 value invoices - end
+
+		-- Update last sync. date
+		print 'Update last sync date:';
+		update system.dbo.ZKUP_KUPOT
+		set	LASTSYNCDATE = datediff(mi,'1/01/1988', getdate()),		
+			LASTSALESSYNC = datediff(mi,'1/01/1988', getdate())
+		where  NAME = @name and KUPENV = @kupenv;
+	
+		print 'Commit:';
+		commit;
+
+		end try
+
+		begin catch
+			if (@@Trancount > 0 ) rollback
+
+			declare @message varchar(max), @error int;
+			select @message = ERROR_MESSAGE(), @error = ERROR_NUMBER();
+			raiserror('Error number: %d, message : %s',16,1,@error, @message);
+		end catch
+
+
+
+fetch next from c into @name, @kupenv, @db, @LASTSYNCDATE, @booknumid;
+
+end
+
+close c;
+deallocate c;
+
+end
+
+
+
+
+
+GO
+
+
