@@ -1,7 +1,7 @@
 USE [system]
 GO
 
-/****** Object:  StoredProcedure [dbo].[royy_sync_transactions_new_flag]    Script Date: 31/03/2019 08:01:39 ******/
+/****** Object:  StoredProcedure [dbo].[royy_sync_transactions_new_flag_2]    Script Date: 03/06/2019 12:27:31 ******/
 SET ANSI_NULLS ON
 GO
 
@@ -9,7 +9,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 
-CREATE PROCEDURE [dbo].[royy_sync_transactions_new_flag]
+CREATE PROCEDURE [dbo].[royy_sync_transactions_new_flag_2]
 AS
 
 declare	@daysback int = 5
@@ -63,7 +63,36 @@ begin
 		begin transaction;
 
 		
+			-- Bills
+		print 'Bills:';
 
+		create table #tmpBills(
+			BILLNO varchar(50),
+			BILLDATE  int,
+			IDENTCUSTNAME varchar(22),
+			CLOSETYPE varchar(22),
+			CASHIER varchar(22),
+			CUSTNAME varchar(22)
+			)
+
+
+			set @sqlquery = '
+		insert into #tmpBills
+		Exec  '+ @toEnv +'.[dbo].[royy_Bills] ' + @booknumid + ''
+		
+
+		--print @sqlquery
+
+		exec sp_executesql @sqlquery
+
+		set @sqlquery = 
+		'INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS(BILLNO, CURDATE, IDENTCUSTNAME, CLOSETYPE, CASHIER,CUSTNAME)
+		SELECT BILLNO,BILLDATE,IDENTCUSTNAME,CLOSETYPE,CASHIER,CUSTNAME
+		from #tmpBills
+		'
+		
+		--print @sqlquery
+		exec sp_executesql @sqlquery
 
 		-- Payments
 		print 'Payments:';
@@ -97,10 +126,11 @@ begin
 		set @sqlquery = 
 		'INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS_PAY(BILLNO, LINE, PAYMENTCODE, GROUPPAYMENTCODE, QPRICE, BOOKNUM, BANKCODE, BRANCH, PAYACCOUNT,
 		IDNUMBER, PAYDATE, VALIDMONTH, CARDNUM, CREDITCODE, NUMPAY, FIRSTPAY)
-		SELECT BILLNO, LINE, PAYMENTCODE, GROUPPAYMENTCODE , 
+		SELECT #tmpPayments.BILLNO, #tmpPayments.LINE, PAYMENTCODE, GROUPPAYMENTCODE , 
 		QPRICE, BOOKNUM , BANKCODE, BRANCH, PAYACCOUNT ,IDNUMBER, 
 		PAYDATE, VALIDMONTH , CARDNUM, CREDITCODE, 	NUMPAY, FIRSTPAY
-		from #tmpPayments'  ;
+		from #tmpPayments
+		inner join #tmpBills on #tmpPayments.BILLNO = #tmpBills.BILLNO '  ;
 
 	 -- print @sqlquery
 		exec sp_executesql @sqlquery 
@@ -143,45 +173,17 @@ create table #tmpItems(
 		set @sqlquery ='
 		INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS_PART
 		 (BILLNO  , LINE, PARTNAME, PRICE, QUANT, QPRICE, DISPRICE, VATFLAG, VAT, FIELDVALUE)
-		 select BILLNO + @booknumid,LINE,PART.PARTNAME,price ,Qty ,Total ,NetTotal ,VAT,VATRate ,Value
+		 select #tmpItems.BILLNO + @booknumid,#tmpItems.LINE,PART.PARTNAME,price ,Qty ,Total ,NetTotal ,VAT,VATRate ,Value
 		 from #tmpItems
-		 inner join [a080413].[dbo].PART on #tmpItems.PART = PART.PART'
+		 inner join [a080413].[dbo].PART on #tmpItems.PART = PART.PART
+		 inner join #tmpBills on #tmpItems.BILLNO + @booknumid = #tmpBills.BILLNO '
 
 		--print @sqlquery
 		exec sp_executesql @sqlquery , N'@LASTSYNCDATE int, @booknumid varchar(50)', 	@LASTSYNCDATE, @booknumid
 		
 		drop table #tmpItems
 		
-		-- Bills
-		print 'Bills:';
-
-		create table #tmpBills(
-			BILLNO varchar(50),
-			BILLDATE  int,
-			IDENTCUSTNAME varchar(22),
-			CLOSETYPE varchar(22),
-			CASHIER varchar(22),
-			CUSTNAME varchar(22)
-			)
-
-
-			set @sqlquery = '
-		insert into #tmpBills
-		Exec  '+ @toEnv +'.[dbo].[royy_Bills] ' + @booknumid + ''
-		
-
-		--print @sqlquery
-
-		exec sp_executesql @sqlquery
-
-		set @sqlquery = 
-		'INSERT INTO [' + @dname + '].[dbo].ZKUP_LOADBILLS(BILLNO, CURDATE, IDENTCUSTNAME, CLOSETYPE, CASHIER,CUSTNAME)
-		SELECT BILLNO,BILLDATE,IDENTCUSTNAME,CLOSETYPE,CASHIER,CUSTNAME
-		from #tmpBills
-		'
-		
-		--print @sqlquery
-		exec sp_executesql @sqlquery
+	
 
 		drop table #tmpBills
 
